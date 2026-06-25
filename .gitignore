@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+.env
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+*.log
+christmas_tree_*.png
+aurora_tree_*.png

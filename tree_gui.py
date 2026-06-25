@@ -1,971 +1,902 @@
 #!/usr/bin/env python3
 """
-GUI animated Christmas tree with decorations.
+Aurora Christmas Tree.
 
-Features:
-- Prompts for your name in a dialog.
-- Opens a new window and animates flashing points to form a tree.
-- Adds ornaments, string lights, and gifts at the base.
-- Pops up a greeting with your name when the tree finishes.
-
-Run: `python tree_gui.py`
+A polished Tkinter desktop app that renders a dense, animated Christmas tree
+from thousands of tiny moving particles.
 """
-import tkinter as tk
-from tkinter import simpledialog, messagebox
+from __future__ import annotations
 
-import random
+import argparse
 import math
-try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
+import random
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
 
-class ChristmasTreeGUI:
-    def __init__(self, name=None, width=800, height=600):
-        self.root = tk.Tk()
-        self.root.title('Merry Christmas')
-        self.width = width
-        self.height = height
-        self.canvas = tk.Canvas(self.root, width=self.width, height=self.height, bg='#0b1220')
-        self.canvas.pack()
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-        # prepare PIL backing image and PhotoImage for smooth rendering
-        if PIL_AVAILABLE:
-            self.img = Image.new('RGBA', (self.width, self.height), '#0b1220')
-            self.draw = ImageDraw.Draw(self.img)
-            self.photo = ImageTk.PhotoImage(self.img)
-            self.canvas_image = self.canvas.create_image(0, 0, anchor='nw', image=self.photo)
-            # keep a small cache of PhotoImage objects to avoid GC issues
-            self._photo_cache = [self.photo]
 
-        self.name = name
-        self.tree_top_y = 30
-        # increase rows to add many more points (taller tree)
-        self.tree_height_rows = 34
-        # initial pixel parameters (will be adapted to window in build_positions)
-        self.point_spacing = 3
-        self.point_v_spacing = 3
-        self.pixel_size = 3
+tk = None
+filedialog = None
+simpledialog = None
+ImageTk = None
 
-        self.points = []  # list of (row, col, x, y)
-        # particles: moving pixels that fly toward target positions
-        self.particles = []  # list of dicts with start/target/progress
-        self.revealed = set()
-        self.ornament_ids = set()
-        self.lights = []  # list of canvas ids for lights
 
-        self.build_positions()
-        self.create_gifts()
-        self.create_star()
-
-        # prepare pixel text for name and greeting
-        self.name_pixel_ids = []
-        self.greeting_pixel_ids = []
-        self.prepare_text_pixels()
-        self.animation_running = True
-        self.flash_cycle = 0
-        self.greet_shown = False
-        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
-
-    def build_positions(self):
-        cx = self.width // 2
-        top = self.tree_top_y
-        rows = self.tree_height_rows
-        # Compute spacing dynamically so the tree fills most of the canvas
-        max_cols = 2 * (rows - 1) + 1
-        # use most of canvas width for tree (close to full width)
-        avail_w = int(self.width * 0.92)
-        # horizontal spacing per column (at least 2 pixels)
-        h_spacing = max(2, avail_w // max_cols)
-        # vertical spacing: fit rows into available height under the top (leave room for text)
-        # leave modest space for text/greeting below
-        avail_h = max(100, self.height - top - 80)
-        v_spacing = max(2, avail_h // rows)
-
-        # store computed spacings for other code to use
-        self.point_spacing = h_spacing
-        self.point_v_spacing = v_spacing
-        # pick pixel size relative to horizontal spacing
-        self.pixel_size = max(2, h_spacing // 2)
-
-        for r in range(rows):
-            cols = 2 * r + 1
-            row_y = top + r * (self.point_v_spacing + 1)
-            row_width = cols * (self.point_spacing + 1)
-            start_x = cx - row_width // 2
-            for c in range(cols):
-                x = start_x + c * (self.point_spacing + 1)
-                y = row_y
-                # store target position
-                self.points.append((r, c, x, y))
-                # create a particle that will fly from a random offscreen start to (x,y)
-                angle = random.random() * 2 * math.pi
-                # start radius: somewhere off-canvas
-                diag = math.hypot(self.width, self.height)
-                radius = random.uniform(diag * 0.5, diag * 1.2)
-                sx = cx + math.cos(angle) * radius
-                sy = top + math.sin(angle) * radius
-                # depth factor (affects size and brightness)
-                depth = random.uniform(0.6, 1.2)
-                # particle parameters; rendering will be done by PIL per-frame
-                steps = random.randint(18, 48)
-                particle = {
-                    'index': len(self.points) - 1,
-                    'row': r,
-                    'start_x': sx,
-                    'start_y': sy,
-                    'target_x': x,
-                    'target_y': y,
-                    'step': 0,
-                    'steps': steps,
-                    'depth': depth,
-                    'arrived': False,
-                    'size': max(1, int(self.pixel_size * 0.5 * depth)),
-                    # floating phase for subtle post-arrival motion
-                    'float_phase': random.random() * 2 * math.pi,
-                    'float_amp': random.uniform(0.6, 2.4) * (1.4 - depth),
-                    'final_color': None,
-                    # velocity for fluid motion
-                    'vx': (x - sx) * 0.02,
-                    'vy': (y - sy) * 0.02,
-                    'state': 'flying',
-                    'angle': random.random() * 2 * math.pi,
-                    'orbit_radius': random.uniform(0.5, 2.6) * (1.6 - depth),
-                }
-                self.particles.append(particle)
-
-        # --- (Initial starts will be reassigned later) ---
-        # We intentionally defer assigning a unified incoming direction here
-        # so that trunk/star particles (appended below) can be handled together.
-
-        # --- Add trunk and star target points so they are constructed from particles too ---
-        # trunk grid
-        trunk_w = max(10, self.pixel_size * 6)
-        trunk_h = max(24, (self.tree_height_rows * (self.point_v_spacing + 1)) // 6)
-        base_y = top + rows * (self.point_v_spacing + 1) + 10
-        trunk_left = cx - trunk_w // 2
-        trunk_top = base_y
-        # grid spacing
-        step_x = self.point_spacing + 1
-        step_y = self.point_v_spacing + 1
-        cols_t = max(2, trunk_w // step_x)
-        rows_t = max(2, trunk_h // step_y)
-        for rr in range(rows_t):
-            for cc in range(cols_t):
-                tx = trunk_left + cc * step_x + step_x // 2
-                ty = trunk_top + rr * step_y + step_y // 2
-                self.points.append(('trunk', rr, tx, ty))
-                # create particle targeting trunk cell
-                angle0 = random.random() * 2 * math.pi
-                radius = random.uniform(diag * 0.6, diag * 1.0)
-                sx = cx + math.cos(angle0) * radius
-                sy = top + math.sin(angle0) * radius
-                depth = random.uniform(0.7, 1.0)
-                particle = {
-                    'index': len(self.points) - 1,
-                    'row': rows + rr,
-                    'start_x': sx,
-                    'start_y': sy,
-                    'target_x': tx,
-                    'target_y': ty,
-                    'step': 0,
-                    'steps': random.randint(20, 46),
-                    'depth': depth,
-                    'arrived': False,
-                    'size': max(1, int(self.pixel_size * 0.6 * depth)),
-                    'float_phase': random.random() * 2 * math.pi,
-                    'float_amp': random.uniform(0.6, 1.6),
-                    'final_color': None,
-                    'vx': (tx - sx) * 0.02,
-                    'vy': (ty - sy) * 0.02,
-                    'state': 'flying',
-                    'angle': random.random() * 2 * math.pi,
-                    'orbit_radius': random.uniform(0.6, 1.6) * (1.4 - depth),
-                }
-                self.particles.append(particle)
-
-        # star points (small cluster around top)
-        if self.points:
-            try:
-                top_px = self.points[0]
-                sx = top_px[2]
-                sy = top_px[3] - int(self.point_v_spacing * 1.5)
-            except Exception:
-                sx = cx
-                sy = top
-            star_rad = max(6, int(self.pixel_size * 4))
-            for i in range(10):
-                ang = i * 2 * math.pi / 10
-                tx = int(sx + math.cos(ang) * (star_rad * random.uniform(0.4, 1.0)))
-                ty = int(sy + math.sin(ang) * (star_rad * random.uniform(0.4, 1.0)))
-                self.points.append(('star', i, tx, ty))
-                angle0 = random.random() * 2 * math.pi
-                radius = random.uniform(diag * 0.5, diag * 0.9)
-                sx0 = cx + math.cos(angle0) * radius
-                sy0 = top + math.sin(angle0) * radius
-                depth = random.uniform(0.8, 1.0)
-                particle = {
-                    'index': len(self.points) - 1,
-                    'row': -1,
-                    'start_x': sx0,
-                    'start_y': sy0,
-                    'target_x': tx,
-                    'target_y': ty,
-                    'step': 0,
-                    'steps': random.randint(10, 40),
-                    'depth': depth,
-                    'arrived': False,
-                    'size': max(1, int(self.pixel_size * 0.8 * depth)),
-                    'float_phase': random.random() * 2 * math.pi,
-                    'float_amp': random.uniform(0.6, 1.2),
-                    'final_color': None,
-                    'vx': (tx - sx0) * 0.02,
-                    'vy': (ty - sy0) * 0.02,
-                    'state': 'flying',
-                    'angle': random.random() * 2 * math.pi,
-                    'orbit_radius': random.uniform(0.6, 1.4) * (1.4 - depth),
-                }
-                self.particles.append(particle)
-
-        # optionally increase particle density for a more 'fluid' look
-        # multiplier controls how many moving particles per tree point
-        # increase this for many-many particles (watch performance)
-        configured_density = 6  # desired default density
-
-        # safety cap: limit total particle count to avoid freezing on slow machines
-        max_particles = 3500
-        base_points = len(self.particles)
-        if base_points == 0:
-            self.particle_density = 1
-        else:
-            # compute density that would keep total under max_particles
-            safe_density = max(1, min(configured_density, max_particles // base_points))
-            self.particle_density = safe_density
-
-        if self.particle_density > 1:
-            extra = []
-            for p in self.particles:
-                for k in range(self.particle_density - 1):
-                    q = p.copy()
-                    # jitter start slightly and randomize velocity to avoid strict clones
-                    q['start_x'] = p['start_x'] + random.uniform(-40, 40)
-                    q['start_y'] = p['start_y'] + random.uniform(-40, 40)
-                    q['vx'] = p['vx'] * random.uniform(0.6, 1.6)
-                    q['vy'] = p['vy'] * random.uniform(0.6, 1.6)
-                    q['float_phase'] = random.random() * 2 * math.pi
-                    q['angle'] = random.random() * 2 * math.pi
-                    # small variation in orbit radius
-                    q['orbit_radius'] = max(0.8, q.get('orbit_radius', 1.0) * random.uniform(0.6, 1.6))
-                    extra.append(q)
-            self.particles.extend(extra)
-
-        # 重新分配起始位置：所有粒子从左右两边汇集到中央
-        # 根据目标x坐标决定从左边还是右边飞来
-        try:
-            cx = self.width // 2
-            for p in self.particles:
-                tx = p['target_x']
-                ty = p['target_y']
-                
-                # 根据目标位置在中心的左边还是右边，决定从哪边飞来
-                if tx < cx:
-                    # 目标在左边，从左边飞来
-                    sx = int(-random.uniform(self.width * 0.3, self.width * 1.0))
-                else:
-                    # 目标在右边，从右边飞来
-                    sx = int(self.width + random.uniform(self.width * 0.3, self.width * 1.0))
-                
-                # y坐标在整个屏幕高度范围内随机，营造从四面八方汇集的效果
-                sy = int(random.uniform(-self.height * 0.3, self.height * 1.2))
-                
-                # 更新粒子起始位置和速度
-                p['start_x'] = sx
-                p['start_y'] = sy
-                p['vx'] = (tx - sx) * 0.02
-                p['vy'] = (ty - sy) * 0.02
-        except Exception:
-            # 如果出错，保持原有起始位置
-            pass
-
-        # final particle count is intentionally silent in normal runs
-
-        # choose ornaments and lights with more harmonious distribution
-        all_idxs = list(range(len(self.points)))
-        # weight ornaments by row: favor middle and lower-middle rows for visual balance
-        row_weights = []
-        for i in all_idxs:
-            r = self.points[i][0]
-            # some entries may be labeled (e.g. 'trunk' or 'star'); map them to numeric
-            if isinstance(r, (int, float)):
-                rnum = r
-            else:
-                if r == 'star':
-                    # star sits at the very top
-                    rnum = 0
-                elif r == 'trunk':
-                    # trunk is below the tree; place weight low for ornaments
-                    rnum = rows + (rows // 6)
-                else:
-                    # fallback to middle of tree
-                    try:
-                        rnum = int(r)
-                    except Exception:
-                        rnum = rows // 2
-            # weight peaks near 60% of tree height
-            wt = 1.0 + max(0, (1.0 - abs((rnum / rows) - 0.6)) * 4.0)
-            row_weights.append(wt)
-        # sample ornaments using weighted roulette
-        ornaments_count = max(12, len(all_idxs)//18)
-        ornaments = set()
-        while len(ornaments) < ornaments_count and len(ornaments) < len(all_idxs):
-            pick = random.choices(all_idxs, weights=row_weights, k=1)[0]
-            ornaments.add(pick)
-
-        # lights: place symmetric pairs along rows so they read as strings
-        lights = []
-        # for each row choose a small number of paired lights
-        for r in range(rows):
-            # find indices in this row
-            row_idxs = [i for i in all_idxs if self.points[i][0] == r]
-            if not row_idxs:
-                continue
-            # sample up to 2 pairs per row depending on width
-            pairs = min(2, max(0, len(row_idxs)//6))
-            for _ in range(pairs):
-                pi = random.choice(row_idxs)
-                rr, cc, tx, ty = self.points[pi]
-                # find mirrored column if available
-                # choose a small horizontal offset for visual spacing
-                offset = (self.point_spacing + 1) * random.randint(1, max(1, cc//3 + 1))
-                left_x = tx - offset
-                right_x = tx + offset
-                lights.append((left_x, ty))
-                lights.append((right_x, ty))
-
-        self.ornament_map = set(ornaments)
-        self.lights_map = set([i for i in all_idxs if i in ornaments])
-        # lights: store light target positions; drawing will be handled in render
-        self.lights = lights
-
-        # create some gifts near the base, symmetric and ribboned
-        self.gift_pixel_ids = []
-        base_candidates = []
-        for i in all_idxs:
-            r = self.points[i][0]
-            try:
-                if isinstance(r, (int, float)) and r >= rows - 3:
-                    base_candidates.append(i)
-            except Exception:
-                # skip non-numeric row labels (e.g. 'trunk'/'star')
-                continue
-        gift_spots = []
-        if base_candidates:
-            count = max(2, len(base_candidates)//12)
-            # pick symmetric pairs across center
-            center = self.width // 2
-            for _ in range(count):
-                spot = random.choice(base_candidates)
-                r, c, x, y = self.points[spot]
-                # place one on left and one mirrored on right (if room)
-                gift_spots.append((x, y))
-                mirrored_x = center + (center - x)
-                gift_spots.append((mirrored_x, y))
-        # generate clusters with ribbon color
-        gift_colors = ['#c62828', '#1565c0', '#6a1b9a', '#ffd54a']
-        ribbon_colors = ['#ffd54a', '#ffffff']
-        for (gx, gy) in gift_spots:
-            cluster = []
-            for dy in (0, 1):
-                for dx in (-1, 0, 1):
-                    px = gx + dx * (self.point_spacing + 1)
-                    py = gy + dy * (self.point_v_spacing + 1)
-                    # choose ribbon pixel in center
-                    if dx == 0 and dy == 0:
-                        cluster.append({'x': px, 'y': py, 'ribbon': True, 'color': random.choice(ribbon_colors)})
-                    else:
-                        cluster.append({'x': px, 'y': py, 'ribbon': False, 'color': random.choice(gift_colors)})
-            self.gift_pixel_ids.append(cluster)
-
-    def create_star(self):
-        # place a star at the top position (above first row)
-        if not self.points:
-            return
-        _, _, x, y = self.points[0]
-        # store star position for PIL rendering (do not create canvas polygon)
-        self.star_pos = (x, y)
-
-    # --- Utility: simple color helpers and 3D pixel drawing ---
-    def hex_to_rgb(self, h):
-        h = h.lstrip('#')
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-    def rgb_to_hex(self, rgb):
-        return '#%02x%02x%02x' % (max(0, min(255, int(rgb[0]))), max(0, min(255, int(rgb[1]))), max(0, min(255, int(rgb[2]))))
-
-    def brighten(self, hexc, factor=1.3):
-        r, g, b = self.hex_to_rgb(hexc)
-        return self.rgb_to_hex((r * factor, g * factor, b * factor))
-
-    def darken(self, hexc, factor=0.6):
-        r, g, b = self.hex_to_rgb(hexc)
-        return self.rgb_to_hex((r * factor, g * factor, b * factor))
-
-    def create_pixel(self, x, y, color, size=None):
-        # create a small 3D-looking pixel at (x,y). Returns tuple of ids (base, highlight, shadow)
-        if size is None:
-            size = self.pixel_size
-        half = max(1, size // 2)
-        base = self.canvas.create_rectangle(x-half, y-half, x+half, y+half, fill=color, outline='')
-        # highlight and shadow adapted for very small pixels: draw tiny top-left and bottom-right accents
-        hl_color = self.brighten(color, 1.4)
-        sh_color = self.darken(color, 0.5)
-        try:
-            # top-left accent
-            hl = self.canvas.create_rectangle(x-half, y-half, x, y, fill=hl_color, outline='')
-            # bottom-right accent
-            sh = self.canvas.create_rectangle(x, y, x+half, y+half, fill=sh_color, outline='')
-        except Exception:
-            hl = None
-            sh = None
-        return (base, hl, sh)
-
-    def move_pixel(self, ids, x, y, size=None):
-        # move an existing 3D pixel (ids tuple) to new center (x,y) and resize
-        # legacy helper (no-op when using PIL rendering)
+def load_tkinter() -> None:
+    global tk, filedialog, simpledialog, ImageTk
+    if tk is not None:
         return
 
-    def create_gifts(self):
-        # Instead of drawing large boxes at the base, place a trunk and
-        # rely on gift pixel clusters and trunk particles attached to tree positions.
-        # set gift_ids empty for compatibility; actual gifts are pixel clusters created in build_positions
-        self.gift_ids = []
+    import tkinter as tk_module
+    from tkinter import filedialog as filedialog_module
+    from tkinter import simpledialog as simpledialog_module
+    from PIL import ImageTk as image_tk_module
 
-    def prepare_text_pixels(self):
-        # render the name and a blessing message as pixel blocks
-        who = self.name if self.name else 'Friend'
-        greeting = 'Merry Christmas'
-        # place name below the tree base
-        base_y = self.tree_top_y + self.tree_height_rows * (self.point_v_spacing + 1) + 36
-        # Render greeting then name (greeting above name)
-        if PIL_AVAILABLE:
-            # larger render scale for clarity: prepare structured pixel descriptors
-            g_coords = self.render_text_pixels(greeting, base_y - 18)
-            n_coords = self.render_text_pixels(who, base_y + 18)
+    tk = tk_module
+    filedialog = filedialog_module
+    simpledialog = simpledialog_module
+    ImageTk = image_tk_module
 
-            def make_pixel_list(coords, base_colors):
-                if not coords:
-                    return []
-                xs = [c[0] for c in coords]
-                min_x, max_x = min(xs), max(xs)
-                span = max(1, max_x - min_x)
-                pixels = []
-                for i, (x, y) in enumerate(coords):
-                    t = (x - min_x) / span
-                    # pick gradient color across provided base_colors
-                    ci = int(t * (len(base_colors) - 1))
-                    base_color = base_colors[ci]
-                    pixels.append({'x': x, 'y': y, 'phase': random.random() * 2 * math.pi, 'base_color': base_color})
-                return pixels
 
-            # choose a richer gradient for the greeting and name
-            greet_base = ['#ffd54a', '#ff8a65', '#ff7043', '#f06292', '#ba68c8']
-            name_base = ['#ffffff', '#e0f7fa', '#b2ebf2']
-            self.greeting_pixels = make_pixel_list(g_coords, greet_base)
-            self.name_pixels = make_pixel_list(n_coords, name_base)
-            # keep compatibility fields empty for non-PIL paths
-            self.greeting_pixel_ids = []
-            self.name_pixel_ids = []
-        else:
-            # fallback: normal canvas text if Pillow not installed
-            self.greeting_pixel_ids = [self.canvas.create_text(self.width//2, base_y - 12, text=greeting,
-                                                               fill='white', font=('Helvetica', 14, 'bold'))]
-            self.name_pixel_ids = [self.canvas.create_text(self.width//2, base_y + 12, text=who,
-                                                            fill='white', font=('Helvetica', 14, 'bold'))]
+THEMES = {
+    "aurora": {
+        "name": "Aurora",
+        "bg_top": "#020713",
+        "bg_mid": "#071827",
+        "bg_bottom": "#13091f",
+        "mist_a": "#00e5ff",
+        "mist_b": "#b36bff",
+        "leaf_shadow": "#05391f",
+        "leaf_mid": "#13b86a",
+        "leaf_light": "#7dffb2",
+        "gold": "#ffd166",
+        "rose": "#ff5fa2",
+        "cyan": "#5de7ff",
+        "violet": "#b892ff",
+        "snow": "#f5fbff",
+    },
+    "ruby": {
+        "name": "Ruby",
+        "bg_top": "#12040d",
+        "bg_mid": "#260a1b",
+        "bg_bottom": "#070918",
+        "mist_a": "#ff4d8d",
+        "mist_b": "#ffcf6e",
+        "leaf_shadow": "#07361f",
+        "leaf_mid": "#1cc46d",
+        "leaf_light": "#95ffb8",
+        "gold": "#ffe08a",
+        "rose": "#ff6e8a",
+        "cyan": "#79e5ff",
+        "violet": "#e09cff",
+        "snow": "#fff8f1",
+    },
+    "frost": {
+        "name": "Frost",
+        "bg_top": "#03101a",
+        "bg_mid": "#082b38",
+        "bg_bottom": "#10162c",
+        "mist_a": "#5df4ff",
+        "mist_b": "#9fb7ff",
+        "leaf_shadow": "#074039",
+        "leaf_mid": "#12bfa5",
+        "leaf_light": "#8fffe8",
+        "gold": "#fff0aa",
+        "rose": "#ff8fc7",
+        "cyan": "#68e8ff",
+        "violet": "#9fa8ff",
+        "snow": "#f8ffff",
+    },
+}
 
-    def animate(self):
-        # animate frame
-        # advance particle positions (flight progress)
-        for p in self.particles:
-            if p['arrived']:
+
+@dataclass(frozen=True)
+class TreeParticle:
+    theta: float
+    level: float
+    radius: float
+    size: float
+    color: str
+    role: str
+    phase: float
+    spin: float
+    orbit: float
+    depth: float
+
+
+@dataclass(frozen=True)
+class SnowParticle:
+    x: float
+    y: float
+    size: float
+    speed: float
+    drift: float
+    phase: float
+    alpha: int
+
+
+@dataclass(frozen=True)
+class StarParticle:
+    x: float
+    y: float
+    z: float
+    size: float
+    color: str
+    phase: float
+
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_to_hex(rgb: Iterable[float]) -> str:
+    channels = [max(0, min(255, int(channel))) for channel in rgb]
+    return "#{:02x}{:02x}{:02x}".format(*channels)
+
+
+def blend(left: str, right: str, amount: float) -> str:
+    a = hex_to_rgb(left)
+    b = hex_to_rgb(right)
+    t = clamp(amount)
+    return rgb_to_hex(a[index] * (1 - t) + b[index] * t for index in range(3))
+
+
+def brighten(color: str, factor: float) -> str:
+    r, g, b = hex_to_rgb(color)
+    return rgb_to_hex((r * factor, g * factor, b * factor))
+
+
+def rgba(color: str, alpha: int) -> tuple[int, int, int, int]:
+    return (*hex_to_rgb(color), max(0, min(255, int(alpha))))
+
+
+def ease_out(value: float) -> float:
+    value = clamp(value)
+    return 1 - (1 - value) ** 3
+
+
+def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = (
+        "segoeuib.ttf" if bold else "segoeui.ttf",
+        "arialbd.ttf" if bold else "arial.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+class ParticleTreeScene:
+    """Headless Pillow renderer shared by the GUI and preview command."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        name: str,
+        theme: str = "aurora",
+        density: float = 1.0,
+        seed: int | None = None,
+    ) -> None:
+        self.width = max(720, int(width))
+        self.height = max(560, int(height))
+        self.name = name.strip() or "Friend"
+        self.theme_name = theme if theme in THEMES else "aurora"
+        self.theme = THEMES[self.theme_name]
+        self.density = clamp(density, 0.55, 1.65)
+        self.seed = random.randrange(1_000_000) if seed is None else seed
+        self.rng = random.Random(self.seed)
+        self.rotation_offset = 0.0
+        self.tree_particles: list[TreeParticle] = []
+        self.snow_particles: list[SnowParticle] = []
+        self.star_particles: list[StarParticle] = []
+        self.background = Image.new("RGBA", (self.width, self.height))
+        self._build()
+
+    def rebuild(self, width: int, height: int, density: float | None = None) -> None:
+        self.width = max(720, int(width))
+        self.height = max(560, int(height))
+        if density is not None:
+            self.density = clamp(density, 0.55, 1.65)
+        self.rng = random.Random(self.seed)
+        self._build()
+
+    def set_theme(self, theme: str) -> None:
+        self.theme_name = theme if theme in THEMES else "aurora"
+        self.theme = THEMES[self.theme_name]
+        self.rng = random.Random(self.seed)
+        self._build()
+
+    def reseed(self) -> None:
+        self.seed = random.randrange(1_000_000)
+        self.rng = random.Random(self.seed)
+        self._build()
+
+    def rotate_by(self, delta: float) -> None:
+        self.rotation_offset += delta
+
+    def _build(self) -> None:
+        self.tree_particles = []
+        self.snow_particles = []
+        self.star_particles = []
+        self.background = self._create_background()
+        self._create_tree()
+        self._create_snow()
+
+    def _create_background(self) -> Image.Image:
+        image = Image.new("RGBA", (self.width, self.height), self.theme["bg_top"])
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        for y in range(self.height):
+            t = y / max(1, self.height - 1)
+            if t < 0.55:
+                color = blend(self.theme["bg_top"], self.theme["bg_mid"], t / 0.55)
+            else:
+                color = blend(self.theme["bg_mid"], self.theme["bg_bottom"], (t - 0.55) / 0.45)
+            draw.line([(0, y), (self.width, y)], fill=color)
+
+        self._draw_nebula(image)
+        self._draw_background_stars(image)
+        self._draw_ground_haze(image)
+        return image
+
+    def _draw_nebula(self, image: Image.Image) -> None:
+        layer = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer, "RGBA")
+        for band, color in enumerate((self.theme["mist_a"], self.theme["mist_b"], self.theme["gold"])):
+            points = []
+            base_y = self.height * (0.13 + band * 0.055)
+            amplitude = self.height * (0.025 + band * 0.009)
+            for x in range(-80, self.width + 100, 28):
+                y = base_y + math.sin(x * 0.010 + band * 1.85) * amplitude
+                points.append((x, y))
+            for offset in range(16):
+                shifted = [(x, y + offset * 5) for x, y in points]
+                draw.line(
+                    shifted,
+                    fill=rgba(color, max(0, 34 - offset * 2)),
+                    width=max(1, 8 - offset // 2),
+                    joint="curve",
+                )
+        image.alpha_composite(layer.filter(ImageFilter.GaussianBlur(3)))
+
+    def _draw_background_stars(self, image: Image.Image) -> None:
+        draw = ImageDraw.Draw(image, "RGBA")
+        moon_x = self.width * 0.82
+        moon_y = self.height * 0.14
+        moon_radius = max(18, self.width * 0.023)
+        glow = self._glow((moon_x, moon_y), "#fff4cc", int(moon_radius * 4.2), 72, 22)
+        image.alpha_composite(glow)
+        draw.ellipse(
+            [moon_x - moon_radius, moon_y - moon_radius, moon_x + moon_radius, moon_y + moon_radius],
+            fill=rgba("#fff7d4", 230),
+        )
+        draw.ellipse(
+            [
+                moon_x - moon_radius * 0.2,
+                moon_y - moon_radius * 1.05,
+                moon_x + moon_radius * 1.08,
+                moon_y + moon_radius * 0.55,
+            ],
+            fill=rgba(self.theme["bg_mid"], 230),
+        )
+
+        for _ in range(145):
+            x = self.rng.uniform(12, self.width - 12)
+            y = self.rng.uniform(12, self.height * 0.58)
+            radius = self.rng.uniform(0.45, 1.45)
+            alpha = self.rng.randint(70, 190)
+            draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=rgba("#ffffff", alpha))
+
+    def _draw_ground_haze(self, image: Image.Image) -> None:
+        draw = ImageDraw.Draw(image, "RGBA")
+        y = self.height * 0.895
+        points = [(0, self.height), (0, y)]
+        for x in range(0, self.width + 80, 70):
+            wave = math.sin(x / self.width * math.tau * 1.45) * self.height * 0.012
+            points.append((x, y + wave))
+        points.extend([(self.width, self.height), (0, self.height)])
+        draw.polygon(points, fill=rgba("#071523", 185))
+        draw.line(points[1:-2], fill=rgba(self.theme["mist_a"], 42), width=2)
+
+    def _create_tree(self) -> None:
+        leaf_count = int(4700 * self.density)
+        light_count = int(760 * self.density)
+        ornament_count = int(180 * self.density)
+        dust_count = int(520 * self.density)
+        trunk_count = int(240 * self.density)
+
+        for _ in range(leaf_count):
+            level = self.rng.random() ** 0.58
+            cone_radius = 1.95 * (level ** 0.86)
+            theta = self.rng.random() * math.tau
+            radius = cone_radius * self.rng.uniform(0.36, 1.02)
+            color_mix = self.rng.random()
+            if color_mix < 0.46:
+                color = blend(self.theme["leaf_shadow"], self.theme["leaf_mid"], self.rng.uniform(0.25, 0.85))
+            else:
+                color = blend(self.theme["leaf_mid"], self.theme["leaf_light"], self.rng.uniform(0.18, 0.82))
+            self.tree_particles.append(
+                TreeParticle(
+                    theta=theta,
+                    level=level,
+                    radius=radius,
+                    size=self.rng.uniform(0.75, 1.9),
+                    color=color,
+                    role="leaf",
+                    phase=self.rng.random() * math.tau,
+                    spin=self.rng.uniform(-0.012, 0.018),
+                    orbit=self.rng.uniform(0.004, 0.030),
+                    depth=self.rng.uniform(0.78, 1.25),
+                )
+            )
+
+        for spiral in range(5):
+            turns = self.rng.uniform(2.15, 3.35)
+            phase = self.rng.random() * math.tau
+            color = [self.theme["gold"], self.theme["cyan"], self.theme["rose"], self.theme["violet"], "#ffffff"][spiral]
+            for index in range(max(1, light_count // 5)):
+                level = (index + self.rng.random()) / max(1, light_count // 5)
+                cone_radius = 1.95 * (level ** 0.86)
+                theta = phase + level * math.tau * turns
+                radius = cone_radius * self.rng.uniform(0.90, 1.04)
+                self.tree_particles.append(
+                    TreeParticle(
+                        theta=theta,
+                        level=level,
+                        radius=radius,
+                        size=self.rng.uniform(1.35, 2.65),
+                        color=color,
+                        role="light",
+                        phase=self.rng.random() * math.tau,
+                        spin=self.rng.uniform(0.0, 0.012),
+                        orbit=self.rng.uniform(0.010, 0.045),
+                        depth=self.rng.uniform(0.92, 1.35),
+                    )
+                )
+
+        ornament_palette = [self.theme["gold"], self.theme["rose"], self.theme["cyan"], self.theme["violet"], "#ff6961"]
+        for _ in range(ornament_count):
+            level = self.rng.uniform(0.22, 0.98)
+            theta = self.rng.random() * math.tau
+            radius = 1.95 * (level ** 0.86) * self.rng.uniform(0.70, 1.02)
+            self.tree_particles.append(
+                TreeParticle(
+                    theta=theta,
+                    level=level,
+                    radius=radius,
+                    size=self.rng.uniform(2.0, 3.65),
+                    color=self.rng.choice(ornament_palette),
+                    role="ornament",
+                    phase=self.rng.random() * math.tau,
+                    spin=self.rng.uniform(-0.01, 0.012),
+                    orbit=self.rng.uniform(0.004, 0.020),
+                    depth=self.rng.uniform(0.92, 1.28),
+                )
+            )
+
+        for _ in range(dust_count):
+            level = self.rng.random()
+            theta = self.rng.random() * math.tau
+            radius = 1.95 * (level ** 0.86) * self.rng.uniform(1.05, 1.32)
+            self.tree_particles.append(
+                TreeParticle(
+                    theta=theta,
+                    level=level,
+                    radius=radius,
+                    size=self.rng.uniform(0.55, 1.25),
+                    color=self.rng.choice([self.theme["gold"], self.theme["cyan"], "#ffffff"]),
+                    role="spark",
+                    phase=self.rng.random() * math.tau,
+                    spin=self.rng.uniform(-0.018, 0.024),
+                    orbit=self.rng.uniform(0.030, 0.095),
+                    depth=self.rng.uniform(0.7, 1.45),
+                )
+            )
+
+        for _ in range(trunk_count):
+            level = self.rng.uniform(1.005, 1.12)
+            theta = self.rng.random() * math.tau
+            radius = self.rng.uniform(0.05, 0.23)
+            self.tree_particles.append(
+                TreeParticle(
+                    theta=theta,
+                    level=level,
+                    radius=radius,
+                    size=self.rng.uniform(1.4, 2.4),
+                    color=blend("#6b3519", "#d08a45", self.rng.random()),
+                    role="trunk",
+                    phase=self.rng.random() * math.tau,
+                    spin=0.0,
+                    orbit=self.rng.uniform(0.001, 0.008),
+                    depth=self.rng.uniform(0.9, 1.15),
+                )
+            )
+
+        star_palette = [self.theme["gold"], "#fff8d6", "#ffffff"]
+        for i in range(155):
+            angle = i / 155 * math.tau
+            arm = 1.0 if i % 2 == 0 else 0.46
+            distance = self.rng.uniform(0.0, 0.22) + arm * self.rng.uniform(0.08, 0.22)
+            self.star_particles.append(
+                StarParticle(
+                    x=math.cos(angle) * distance,
+                    y=math.sin(angle) * distance * 0.92,
+                    z=self.rng.uniform(-0.08, 0.08),
+                    size=self.rng.uniform(1.4, 3.1),
+                    color=self.rng.choice(star_palette),
+                    phase=self.rng.random() * math.tau,
+                )
+            )
+
+    def _create_snow(self) -> None:
+        count = int((self.width * self.height) / 7800)
+        for _ in range(max(85, min(210, count))):
+            self.snow_particles.append(
+                SnowParticle(
+                    x=self.rng.uniform(0, self.width),
+                    y=self.rng.uniform(0, self.height),
+                    size=self.rng.uniform(0.6, 2.0),
+                    speed=self.rng.uniform(10, 38),
+                    drift=self.rng.uniform(4, 22),
+                    phase=self.rng.random() * math.tau,
+                    alpha=self.rng.randint(70, 170),
+                )
+            )
+
+    def render(self, elapsed: float) -> Image.Image:
+        image = self.background.copy()
+        draw = ImageDraw.Draw(image, "RGBA")
+        self._draw_snow(draw, elapsed)
+        self._draw_tree(image, elapsed)
+        self._draw_message(image, elapsed)
+        return image
+
+    def _draw_snow(self, draw: ImageDraw.ImageDraw, elapsed: float) -> None:
+        for snow in self.snow_particles:
+            y = (snow.y + elapsed * snow.speed) % (self.height + 24) - 12
+            x = snow.x + math.sin(elapsed * 0.45 + snow.phase) * snow.drift
+            size = snow.size * (0.75 + 0.25 * math.sin(elapsed + snow.phase))
+            draw.ellipse([x - size, y - size, x + size, y + size], fill=rgba(self.theme["snow"], snow.alpha))
+
+    def _draw_tree(self, image: Image.Image, elapsed: float) -> None:
+        scale = min(self.width * 0.120, self.height * 0.145)
+        center_x = self.width * 0.5
+        center_y = self.height * 0.455
+        auto_rotation = elapsed * 0.27 + self.rotation_offset
+        breathe = 1.0 + 0.026 * math.sin(elapsed * 1.1)
+        projected = []
+
+        for particle in self.tree_particles:
+            x, y, z = self._particle_position(particle, elapsed, auto_rotation, breathe)
+            perspective = 2.9 / (2.9 + z)
+            screen_x = center_x + x * scale * perspective
+            screen_y = center_y - y * scale * perspective
+            size = particle.size * perspective * (0.72 + 0.18 * particle.depth)
+            projected.append((self._depth_sort_key(particle, z), z, screen_x, screen_y, size, particle))
+
+        projected.sort(key=lambda item: item[0], reverse=True)
+
+        glow = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow, "RGBA")
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        for _sort_z, z, x, y, size, particle in projected:
+            if not (-20 <= x <= self.width + 20 and -20 <= y <= self.height + 20):
                 continue
-            p['step'] += 1
-            if p['step'] >= p['steps']:
-                p['step'] = p['steps']
-                p['arrived'] = True
-            # interpolation (ease-out)
-            t = p['step'] / p['steps']
-            t = 1 - (1 - t) * (1 - t)
-            p['cur_x'] = p['start_x'] + (p['target_x'] - p['start_x']) * t
-            p['cur_y'] = p['start_y'] + (p['target_y'] - p['start_y']) * t
-            p['cur_size'] = max(1, int(self.pixel_size * (0.4 + 0.6 * t) * p['depth']))
-            if p['arrived']:
-                # freeze final color for stability
-                if p['index'] in self.ornament_map:
-                    p['final_color'] = random.choice(['#e91e63', '#f44336', '#ffeb3b', '#03a9f4', '#9c27b0'])
-                else:
-                    # use a brighter green for visibility against dark background
-                    p['final_color'] = self.brighten('#2e7d32', 1.6)
-                self.revealed.add(p['index'])
+            pulse = math.sin(elapsed * self._pulse_speed(particle.role) + particle.phase)
+            color = self._particle_color(particle, pulse, z)
+            alpha = self._particle_alpha(particle, z)
+            radius = max(0.55, size * (1.0 + 0.12 * max(0, pulse)))
 
-        # render current frame into PIL image for smooth drawing using alpha fade
-        if PIL_AVAILABLE:
-            # fade previous frame slightly to create motion trails (motion blur)
-            try:
-                # ensure image is RGBA mode
-                if getattr(self, 'img', None) is None:
-                    self.img = Image.new('RGBA', (self.width, self.height), '#0b1220')
-                if self.img.mode != 'RGBA':
-                    try:
-                        self.img = self.img.convert('RGBA')
-                    except Exception:
-                        self.img = Image.new('RGBA', (self.width, self.height), '#0b1220')
-                overlay = Image.new('RGBA', (self.width, self.height), (11, 18, 32, 18))
-                self.img = Image.alpha_composite(self.img, overlay)
-                # recreate draw for the updated image reference
-                self.draw = ImageDraw.Draw(self.img)
-            except Exception:
-                # fallback to hard clear
-                self.draw.rectangle([(0, 0), (self.width, self.height)], fill='#0b1220')
+            if particle.role in {"light", "ornament", "spark"}:
+                glow_radius = radius * (4.2 if particle.role == "light" else 2.8)
+                glow_alpha = 58 if particle.role == "light" else 32
+                glow_draw.ellipse(
+                    [x - glow_radius, y - glow_radius, x + glow_radius, y + glow_radius],
+                    fill=rgba(color, glow_alpha),
+                )
 
-            # Star is now composed from particles (no hard polygon draw)
-            # keep `star_pos` available for reference, but rely on particles
-            # to form the visible star instead of drawing a filled polygon here.
+            if radius <= 1.1:
+                draw.point((x, y), fill=rgba(color, alpha))
+            else:
+                draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=rgba(color, alpha))
+                if particle.role in {"light", "ornament"}:
+                    highlight = max(0.75, radius * 0.35)
+                    draw.ellipse(
+                        [x - radius * 0.42, y - radius * 0.48, x - radius * 0.42 + highlight, y - radius * 0.48 + highlight],
+                        fill=rgba("#ffffff", 180),
+                    )
 
-            # Trunk is now built from particles (no hard rectangle draw)
-            # rely on trunk particles created in build_positions() to form it.
+        image.alpha_composite(glow.filter(ImageFilter.GaussianBlur(4)))
+        self._draw_star(image, elapsed, center_x, center_y, scale, auto_rotation)
+        self._draw_base_sparkles(image, elapsed, center_x, center_y, scale)
 
-            # text color (compute before drawing so text uses it)
-            text_on = (self.flash_cycle // 3) % 2 == 0
-            text_color = '#ffd54a' if text_on else '#ffffff'
+    def _depth_sort_key(self, particle: TreeParticle, z: float) -> float:
+        # Larger z is farther from the camera in this projection, so it is drawn first.
+        # The trunk is an inner structure and should sit behind leaf/light particles.
+        role_bias = {
+            "trunk": 3.0,
+            "light": -0.04,
+            "ornament": -0.03,
+            "spark": -0.02,
+        }.get(particle.role, 0.0)
+        return z + role_bias
 
-            # update and draw particles with fluid velocity-based motion
-            for p in self.particles:
-                idx = p['index']
-                # initialize current pos if missing
-                x = p.get('cur_x', p['start_x'])
-                y = p.get('cur_y', p['start_y'])
-                vx = p.get('vx', 0.0)
-                vy = p.get('vy', 0.0)
-                tx = p['target_x']
-                ty = p['target_y']
-                depth = p.get('depth', 1.0)
+    def _particle_position(
+        self,
+        particle: TreeParticle,
+        elapsed: float,
+        rotation: float,
+        breathe: float,
+    ) -> tuple[float, float, float]:
+        level = particle.level
+        tree_y = 2.28 - 4.42 * min(level, 1.0)
+        if particle.role == "trunk":
+            tree_y = -2.22 - (level - 1.0) * 2.7
 
-                # acceleration towards target (gentle) and damping for fluid motion
-                ax = (tx - x) * 0.015 * (1.0 + (1.2 - depth))
-                ay = (ty - y) * 0.015 * (1.0 + (1.2 - depth))
-                vx += ax
-                vy += ay
-                # damping
-                vx *= 0.92
-                vy *= 0.92
+        sway = math.sin(elapsed * 0.78 + level * 4.8 + particle.phase) * (0.035 + 0.05 * (1 - min(level, 1.0)))
+        theta = particle.theta + rotation + particle.spin * elapsed + sway
+        radius = particle.radius * breathe
+        radius += math.sin(elapsed * 1.55 + particle.phase) * particle.orbit
+        x = math.cos(theta) * radius
+        z = math.sin(theta) * radius
+        y = tree_y + math.sin(elapsed * 1.2 + particle.phase) * particle.orbit * 0.55
+        x += math.sin(elapsed * 0.92 + y * 1.2) * 0.026 * (1 - min(level, 1.0))
+        return x, y, z
 
-                # integrate
-                x += vx
-                y += vy
+    def _particle_color(self, particle: TreeParticle, pulse: float, z: float) -> str:
+        depth_light = clamp((z + 2.0) / 4.0)
+        factor = 0.78 + depth_light * 0.28
+        if particle.role == "leaf":
+            factor += max(0, pulse) * 0.20
+        elif particle.role == "light":
+            factor += 0.45 + max(0, pulse) * 0.50
+        elif particle.role == "spark":
+            factor += 0.30 + max(0, pulse) * 0.42
+        elif particle.role == "ornament":
+            factor += 0.22 + max(0, pulse) * 0.25
+        return brighten(particle.color, factor)
 
-                # 判断是否到达目标位置并切换到流动状态
-                dist = math.hypot(tx - x, ty - y)
-                if dist < max(1.5, 1.4 * p.get('size', 1)):
-                    # 到达目标后切换到流动状态
-                    p['state'] = 'flowing'
-                    # 初始化流动角度
-                    if 'flow_angle' not in p:
-                        p['flow_angle'] = random.random() * 2 * math.pi
-                
-                if p.get('state') == 'flowing':
-                    # 所有粒子都在目标位置附近做小范围的圆周流动
-                    # 更新流动角度（持续旋转）
-                    p['flow_angle'] = p.get('flow_angle', 0.0) + random.uniform(0.04, 0.08)
-                    
-                    # 流动半径（小范围）
-                    flow_radius = random.uniform(1.5, 3.5)
-                    
-                    # 计算流动偏移
-                    flow_x = math.cos(p['flow_angle']) * flow_radius
-                    flow_y = math.sin(p['flow_angle']) * flow_radius
-                    
-                    # 在目标位置附近流动
-                    x = tx + flow_x
-                    y = ty + flow_y
-                    
-                    # 添加微小的随机抖动，增加流动感
-                    x += math.cos(self.flash_cycle * 0.05 + idx) * 0.5
-                    y += math.sin(self.flash_cycle * 0.05 + idx) * 0.5
+    def _particle_alpha(self, particle: TreeParticle, z: float) -> int:
+        base = {
+            "leaf": 225,
+            "light": 245,
+            "ornament": 238,
+            "spark": 185,
+            "trunk": 220,
+        }.get(particle.role, 220)
+        return int(base * (0.74 + 0.26 * clamp((z + 2.1) / 4.2)))
 
-                # store back
-                p['cur_x'] = x
-                p['cur_y'] = y
-                p['vx'] = vx
-                p['vy'] = vy
-                p['cur_size'] = max(1, int(p.get('size', 1) * (0.8 + (1.0 - depth) * 0.6)))
+    def _pulse_speed(self, role: str) -> float:
+        return {
+            "leaf": 1.7,
+            "light": 5.8,
+            "ornament": 3.2,
+            "spark": 7.0,
+            "trunk": 1.1,
+        }.get(role, 2.0)
 
-                # 颜色选择：所有粒子在流动状态下保持最终颜色
-                if p.get('state') == 'flowing':
-                    if idx in self.ornament_map:
-                        base_color = p.get('final_color') or random.choice(['#e91e63', '#f44336', '#ffeb3b', '#03a9f4', '#9c27b0'])
-                    else:
-                        base_color = p.get('final_color') or '#2e7d32'
-                else:
-                    # 飞行中的粒子使用闪烁的暖色
-                    base_color = '#ffd54a' if (self.flash_cycle + idx) % 6 < 3 else '#101216'
+    def _draw_star(
+        self,
+        image: Image.Image,
+        elapsed: float,
+        center_x: float,
+        center_y: float,
+        scale: float,
+        rotation: float,
+    ) -> None:
+        star_center_y = center_y - 2.58 * scale
+        pulse = 1.0 + 0.08 * math.sin(elapsed * 4.6)
+        image.alpha_composite(self._glow((center_x, star_center_y), self.theme["gold"], int(scale * 0.46), 110, 18))
+        draw = ImageDraw.Draw(image, "RGBA")
 
-                # 所有粒子都绘制成流动小球，但不同元素有不同特色
-                # 确定粒子所属的点类型
-                point_type = None
-                try:
-                    point_type = self.points[p['index']][0]
-                except Exception:
-                    point_type = None
+        for star in self.star_particles:
+            x3 = star.x * math.cos(rotation * 0.4) - star.z * math.sin(rotation * 0.4)
+            z3 = star.x * math.sin(rotation * 0.4) + star.z * math.cos(rotation * 0.4)
+            perspective = 3.0 / (3.0 + z3)
+            x = center_x + x3 * scale * perspective * pulse
+            y = star_center_y + star.y * scale * perspective * pulse
+            size = star.size * perspective * (1.0 + 0.16 * math.sin(elapsed * 5.4 + star.phase))
+            color = brighten(star.color, 1.0 + 0.35 * max(0, math.sin(elapsed * 5.0 + star.phase)))
+            draw.ellipse([x - size, y - size, x + size, y + size], fill=rgba(color, 238))
 
-                # 判断是否为装饰球
-                is_ornament = (p['index'] in getattr(self, 'ornament_map', set()))
+    def _draw_base_sparkles(self, image: Image.Image, elapsed: float, center_x: float, center_y: float, scale: float) -> None:
+        draw = ImageDraw.Draw(image, "RGBA")
+        base_y = center_y + 2.28 * scale
+        for index in range(80):
+            phase = index * 0.77
+            x = center_x + math.sin(index * 1.91) * scale * 1.03 + math.sin(elapsed * 0.8 + phase) * 5
+            y = base_y + math.cos(index * 1.37) * 18 + math.sin(elapsed * 1.6 + phase) * 3
+            alpha = int(80 + 80 * max(0, math.sin(elapsed * 2.3 + phase)))
+            size = 0.8 + (index % 5) * 0.18
+            draw.ellipse([x - size, y - size, x + size, y + size], fill=rgba(self.theme["gold"], alpha))
 
-                # 根据类型设置不同的小球大小和颜色
-                if point_type == 'star':
-                    # 星星：最大最亮
-                    ball_size = max(3, int(self.pixel_size * 1.2))
-                    pix_color = '#ffd54a'
-                elif point_type == 'trunk':
-                    # 树干：较大，棕色
-                    ball_size = max(3, int(self.pixel_size * 0.9))
-                    pix_color = '#8d6e63'
-                elif is_ornament:
-                    # 装饰球：大一些，彩色
-                    ball_size = max(3, int(self.pixel_size * 1.0))
-                    pix_color = p.get('final_color') or random.choice(['#e91e63', '#f44336', '#ffeb3b', '#03a9f4', '#9c27b0'])
-                else:
-                    # 树叶：正常大小，绿色
-                    ball_size = max(2, int(self.pixel_size * 0.7))
-                    pix_color = base_color
-                
-                half = max(1, int(ball_size // 2))
-                x0 = int(x - half)
-                y0 = int(y - half)
-                x1 = int(x + half)
-                y1 = int(y + half)
+    def _draw_message(self, image: Image.Image, elapsed: float) -> None:
+        draw = ImageDraw.Draw(image, "RGBA")
+        title = f"Merry Christmas, {self.name}"
+        subtitle = "May your holidays shine bright."
+        title_font = load_font(max(26, int(self.width * 0.032)), bold=True)
+        subtitle_font = load_font(max(13, int(self.width * 0.014)), bold=False)
+        title_box = draw.textbbox((0, 0), title, font=title_font)
+        subtitle_box = draw.textbbox((0, 0), subtitle, font=subtitle_font)
+        title_h = title_box[3] - title_box[1]
+        subtitle_h = subtitle_box[3] - subtitle_box[1]
+        gap = max(8, int(self.height * 0.012))
+        top = self.height - title_h - subtitle_h - gap - max(20, int(self.height * 0.030))
 
-                # 绘制流动的小球（所有元素统一样式）
-                try:
-                    # 绘制基础圆形小球
-                    self.draw.ellipse([x0, y0, x1, y1], fill=pix_color)
-                    
-                    # 添加高光效果，让小球更有立体感
-                    hlc = self.brighten(pix_color, 1.5)
-                    # 高光位置（左上角小圆）
-                    hl_size = max(1, half // 2)
-                    try:
-                        self.draw.ellipse([x0, y0, x0 + hl_size, y0 + hl_size], fill=hlc)
-                    except Exception:
-                        pass
-                except Exception:
-                    # 如果绘制失败，使用矩形作为后备
-                    try:
-                        self.draw.rectangle([x0, y0, x1, y1], fill=pix_color)
-                    except Exception:
-                        pass
+        for text, font, y, color in (
+            (title, title_font, top, self.theme["gold"]),
+            (subtitle, subtitle_font, top + title_h + gap, "#eef8ff"),
+        ):
+            box = draw.textbbox((0, 0), text, font=font)
+            x = (self.width - (box[2] - box[0])) / 2
+            draw.text((x + 2, y + 2), text, font=font, fill=rgba("#01040a", 175))
+            if text == title:
+                glow = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+                glow_draw = ImageDraw.Draw(glow, "RGBA")
+                glow_draw.text((x, y), text, font=font, fill=rgba(color, int(88 + 30 * math.sin(elapsed * 2.1))))
+                image.alpha_composite(glow.filter(ImageFilter.GaussianBlur(5)))
+            draw.text((x, y), text, font=font, fill=rgba(color, 245))
 
-            # (debug indicator removed)
+    def _glow(
+        self,
+        center: tuple[float, float],
+        color: str,
+        radius: int,
+        alpha: int,
+        blur: int,
+    ) -> Image.Image:
+        layer = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer, "RGBA")
+        x, y = center
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=rgba(color, alpha))
+        return layer.filter(ImageFilter.GaussianBlur(blur))
 
-            # 绘制灯光为流动的小球，带有脉动效果
-            light_colors = ['#ffd54a', '#ff8a65', '#ff7043', '#f06292', '#4fc3f7']
-            for j, (lx, ly) in enumerate(self.lights):
-                # 灯光使用较大的小球样式，带脉动效果
-                phase = (j * 0.8) + (self.flash_cycle * 0.06)
-                pulse = 0.85 + 0.25 * math.sin(phase)
-                lc = light_colors[j % len(light_colors)]
-                
-                # 灯光：较大且有脉动
-                ball_size = max(3, int(self.pixel_size * 0.85 * pulse))
-                half = max(1, int(ball_size // 2))
-                
-                # 绘制发光的小球
-                try:
-                    # 基础小球
-                    self.draw.ellipse([lx-half, ly-half, lx+half, ly+half], fill=lc)
-                    # 高光效果
-                    hlc = self.brighten(lc, 1.6)
-                    hl_size = max(1, half // 2)
-                    self.draw.ellipse([lx-half, ly-half, lx-half+hl_size, ly-half+hl_size], fill=hlc)
-                except Exception:
-                    self.draw.rectangle([lx-half, ly-half, lx+half, ly+half], fill=lc)
 
-            # 绘制礼物为流动的小球簇，带闪烁效果
-            gift_colors = ['#c62828', '#1565c0', '#6a1b9a', '#ffd54a']
-            for gi, cluster in enumerate(self.gift_pixel_ids):
-                gc = gift_colors[(self.flash_cycle + gi) % len(gift_colors)] if (self.flash_cycle + gi) % 4 < 2 else '#0b1220'
-                for k, item in enumerate(cluster):
-                    if isinstance(item, dict):
-                        gx = item.get('x')
-                        gy = item.get('y')
-                        color = item.get('color', gc)
-                        if item.get('ribbon'):
-                            # 丝带用特殊颜色
-                            color = item.get('color', '#ffd54a')
-                    else:
-                        try:
-                            gx, gy = item
-                        except Exception:
-                            continue
-                        color = gc
-                        if (self.flash_cycle + gi + k) % 5 == 0:
-                            color = self.brighten(gc, 1.2)
-                    
-                    # 礼物小球：中等大小
-                    ball_size = max(2, int(self.pixel_size * 0.8))
-                    half = max(1, int(ball_size // 2))
-                    
-                    # 绘制礼物小球
-                    try:
-                        self.draw.ellipse([gx-half, gy-half, gx+half, gy+half], fill=color)
-                        # 高光
-                        hlc = self.brighten(color, 1.4)
-                        hl_size = max(1, half // 2)
-                        self.draw.ellipse([gx-half, gy-half, gx-half+hl_size, gy-half+hl_size], fill=hlc)
-                    except Exception:
-                        self.draw.rectangle([gx-half, gy-half, gx+half, gy+half], fill=color)
+class ChristmasTreeApp:
+    def __init__(self, name: str, width: int, height: int, theme: str, density: float) -> None:
+        load_tkinter()
+        self.root = tk.Tk()
+        self.root.title("Aurora Christmas Tree")
+        self.root.minsize(860, 660)
+        self.root.configure(bg="#050b16")
 
-            # 绘制文字像素为统一的小球，带波浪和闪烁效果
-            def draw_pixel_list(pixels, default_color, speed=0.12, amp=2.4):
-                for i, pix in enumerate(pixels):
-                    x = pix['x']
-                    y = pix['y']
-                    phase = pix.get('phase', 0.0)
-                    base_color = pix.get('base_color', default_color)
-                    # 波浪偏移
-                    wy = math.sin(self.flash_cycle * speed + phase) * amp
-                    # 闪烁效果
-                    tw = 1.0
-                    if (self.flash_cycle + i) % 12 == 0:
-                        tw = 1.4
-                    color = base_color if tw == 1.0 else self.brighten(base_color, tw)
-                    
-                    # 文字小球：稍大一些以便阅读
-                    ball_size = max(3, int(self.pixel_size * 0.85))
-                    half = max(1, int(ball_size // 2))
-                    bx0 = int(x - half)
-                    by0 = int(y + wy - half)
-                    bx1 = int(x + half)
-                    by1 = int(y + wy + half)
-                    
-                    # 绘制文字小球
-                    try:
-                        self.draw.ellipse([bx0, by0, bx1, by1], fill=color)
-                        # 高光
-                        hlc = self.brighten(color, 1.5)
-                        hl_size = max(1, half // 2)
-                        self.draw.ellipse([bx0, by0, bx0+hl_size, by0+hl_size], fill=hlc)
-                    except Exception:
-                        self.draw.rectangle([bx0, by0, bx1, by1], fill=color)
+        self.scene = ParticleTreeScene(width, height - 66, name, theme=theme, density=density)
+        self.start_time = time.perf_counter()
+        self.elapsed_before_pause = 0.0
+        self.paused = False
+        self.after_id: str | None = None
+        self.resize_after_id: str | None = None
+        self.drag_x: int | None = None
 
-            if hasattr(self, 'greeting_pixels'):
-                draw_pixel_list(self.greeting_pixels, '#ffd54a', speed=0.14, amp=2.6)
-            if hasattr(self, 'name_pixels'):
-                draw_pixel_list(self.name_pixels, '#ffffff', speed=0.10, amp=1.8)
+        self.canvas = tk.Canvas(self.root, bg="#050b16", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
 
-            # push PIL image to PhotoImage and update canvas (recreate PhotoImage)
-            try:
-                self.photo = ImageTk.PhotoImage(self.img)
-                # cache reference to avoid GC and keep a small history
-                try:
-                    self._photo_cache.append(self.photo)
-                    if len(self._photo_cache) > 6:
-                        self._photo_cache.pop(0)
-                except Exception:
-                    self._photo_cache = [self.photo]
-                self.canvas.itemconfigure(self.canvas_image, image=self.photo)
-                # force the canvas to update immediately
-                try:
-                    self.canvas.update_idletasks()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        self.toolbar = tk.Frame(self.root, bg="#071221", padx=12, pady=10)
+        self.toolbar.grid(row=1, column=0, sticky="ew")
+        self.status_var = tk.StringVar(value=f"{len(self.scene.tree_particles):,} particles")
+        self.pause_var = tk.StringVar(value="Pause")
+        self.theme_var = tk.StringVar(value=f"Theme: {self.scene.theme['name']}")
+        self.density_var = tk.DoubleVar(value=density)
+        self._build_toolbar()
 
-        # If PIL is not available, fall back to per-item canvas animation
-        if not PIL_AVAILABLE:
-            # animate lights (cycle colors) -- lights stored as ids tuples for 3D pixels
-            light_colors = ['#ffeb3b', '#ff7043', '#f06292', '#4fc3f7', '#aed581']
-            for j, lid_ids in enumerate(self.lights):
-                # lid_ids may be a tuple (base, hl, sh)
-                color = light_colors[(self.flash_cycle + j) % len(light_colors)] if (self.flash_cycle + j) % 4 < 2 else '#101826'
-                if isinstance(lid_ids, (list, tuple)):
-                    base_id, hl_id, sh_id = lid_ids
-                    self.canvas.itemconfigure(base_id, fill=color)
-                    try:
-                        self.canvas.itemconfigure(hl_id, fill=self.brighten(color, 1.4))
-                        self.canvas.itemconfigure(sh_id, fill=self.darken(color, 0.5))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self.canvas.itemconfigure(lid_ids, fill=color)
-                    except Exception:
-                        pass
+        self.photo = None
+        self.canvas_image = self.canvas.create_image(0, 0, anchor="nw")
 
-            # animate gifts (clusters of pixels) with flashing colors
-            gift_colors = ['#c62828', '#1565c0', '#6a1b9a', '#ffd54a']
-            for gi, cluster in enumerate(self.gift_pixel_ids):
-                gc = gift_colors[(self.flash_cycle + gi) % len(gift_colors)] if (self.flash_cycle + gi) % 4 < 2 else '#0b1220'
-                for pid in cluster:
-                    # pid is an ids tuple for the 3D pixel
-                    if isinstance(pid, (list, tuple)):
-                        base_id, hl_id, sh_id = pid
-                        self.canvas.itemconfigure(base_id, fill=gc)
-                        try:
-                            self.canvas.itemconfigure(hl_id, fill=self.brighten(gc, 1.4))
-                            self.canvas.itemconfigure(sh_id, fill=self.darken(gc, 0.5))
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            self.canvas.itemconfigure(pid, fill=gc)
-                        except Exception:
-                            pass
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<ButtonPress-1>", self._start_drag)
+        self.canvas.bind("<B1-Motion>", self._drag_rotate)
+        self.canvas.bind("<ButtonRelease-1>", self._end_drag)
+        self.root.bind("<space>", lambda _event: self.toggle_pause())
+        self.root.bind("<r>", lambda _event: self.replay())
+        self.root.bind("<R>", lambda _event: self.replay())
+        self.root.bind("<s>", lambda _event: self.save_snapshot())
+        self.root.bind("<S>", lambda _event: self.save_snapshot())
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-            # animate pixel-text (name and greeting) by toggling pixel colors
-            text_on = (self.flash_cycle // 3) % 2 == 0
-            text_color = '#ffd54a' if text_on else '#ffffff'
-            for pid in self.greeting_pixel_ids:
-                try:
-                    if isinstance(pid, (list, tuple)):
-                        base_id, hl_id, sh_id = pid
-                        self.canvas.itemconfigure(base_id, fill=text_color)
-                        if hl_id:
-                            self.canvas.itemconfigure(hl_id, fill=self.brighten(text_color, 1.2))
-                        if sh_id:
-                            self.canvas.itemconfigure(sh_id, fill=self.darken(text_color, 0.8))
-                    else:
-                        self.canvas.itemconfigure(pid, fill=text_color)
-                except Exception:
-                    # fallback to text item or ignore
-                    pass
-            for pid in self.name_pixel_ids:
-                try:
-                    if isinstance(pid, (list, tuple)):
-                        base_id, hl_id, sh_id = pid
-                        self.canvas.itemconfigure(base_id, fill=text_color)
-                        if hl_id:
-                            self.canvas.itemconfigure(hl_id, fill=self.brighten(text_color, 1.2))
-                        if sh_id:
-                            self.canvas.itemconfigure(sh_id, fill=self.darken(text_color, 0.8))
-                    else:
-                        self.canvas.itemconfigure(pid, fill=text_color)
-                except Exception:
-                    pass
+    def _build_toolbar(self) -> None:
+        button_style = {
+            "bg": "#13243a",
+            "fg": "#f5fbff",
+            "activebackground": "#1f3d61",
+            "activeforeground": "#ffffff",
+            "relief": "flat",
+            "bd": 0,
+            "padx": 14,
+            "pady": 8,
+            "font": ("Segoe UI", 10, "bold"),
+            "cursor": "hand2",
+        }
+        tk.Button(self.toolbar, textvariable=self.pause_var, command=self.toggle_pause, **button_style).pack(side="left")
+        tk.Button(self.toolbar, text="Replay", command=self.replay, **button_style).pack(side="left", padx=(8, 0))
+        tk.Button(self.toolbar, text="Save PNG", command=self.save_snapshot, **button_style).pack(side="left", padx=(8, 0))
+        tk.Button(self.toolbar, textvariable=self.theme_var, command=self.next_theme, **button_style).pack(side="left", padx=(8, 0))
 
-        self.flash_cycle += 1
+        tk.Label(self.toolbar, text="Density", bg="#071221", fg="#b9c8dc", font=("Segoe UI", 10)).pack(
+            side="left",
+            padx=(18, 6),
+        )
+        tk.Scale(
+            self.toolbar,
+            from_=0.55,
+            to=1.65,
+            resolution=0.05,
+            orient="horizontal",
+            length=145,
+            variable=self.density_var,
+            command=self._density_changed,
+            bg="#071221",
+            troughcolor="#1f3d61",
+            fg="#f5fbff",
+            highlightthickness=0,
+            bd=0,
+        ).pack(side="left")
 
-        # continue or finish
-        if len(self.revealed) < len(self.points):
-            if self.animation_running:
-                self.root.after(60, self.animate)
+        tk.Label(self.toolbar, textvariable=self.status_var, bg="#071221", fg="#dcecff", font=("Segoe UI", 10)).pack(
+            side="right"
+        )
+
+    def _density_changed(self, value: str) -> None:
+        try:
+            density = float(value)
+        except ValueError:
+            return
+        self.scene.rebuild(self.scene.width, self.scene.height, density=density)
+        self.status_var.set(f"{len(self.scene.tree_particles):,} particles")
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        if event.width < 20 or event.height < 20:
+            return
+        if self.resize_after_id:
+            self.root.after_cancel(self.resize_after_id)
+        self.resize_after_id = self.root.after(150, lambda: self._resize_scene(event.width, event.height))
+
+    def _resize_scene(self, width: int, height: int) -> None:
+        self.resize_after_id = None
+        self.scene.rebuild(width, height, density=self.density_var.get())
+
+    def _start_drag(self, event: tk.Event) -> None:
+        self.drag_x = event.x
+
+    def _drag_rotate(self, event: tk.Event) -> None:
+        if self.drag_x is None:
+            self.drag_x = event.x
+            return
+        self.scene.rotate_by((event.x - self.drag_x) * 0.006)
+        self.drag_x = event.x
+
+    def _end_drag(self, _event: tk.Event) -> None:
+        self.drag_x = None
+
+    def current_elapsed(self) -> float:
+        if self.paused:
+            return self.elapsed_before_pause
+        return self.elapsed_before_pause + time.perf_counter() - self.start_time
+
+    def toggle_pause(self) -> None:
+        if self.paused:
+            self.paused = False
+            self.start_time = time.perf_counter()
+            self.pause_var.set("Pause")
+            self._schedule()
         else:
-            # finished reveal: ensure all points are shown once
-            if not self.greet_shown:
-                # finalize colors for all particles (store on particle dict)
-                for p in self.particles:
-                    if 'final_color' in p:
-                        continue
-                    if p['index'] in self.ornament_map:
-                        p['final_color'] = random.choice(['#e91e63', '#f44336', '#ffeb3b', '#03a9f4', '#9c27b0'])
-                    else:
-                        p['final_color'] = '#2e7d32'
-                # small delay then popup greeting (only once)
-                self.root.after(600, self.show_greeting)
-                self.greet_shown = True
-            # 继续动画，保持灯光/礼物/文字的闪烁效果
-            # 确保所有粒子都切换到流动状态
-            for p in self.particles:
-                if p.get('state') != 'flowing':
-                    p['state'] = 'flowing'
-                # 初始化流动角度
-                if 'flow_angle' not in p:
-                    p['flow_angle'] = random.random() * 2 * math.pi
-                # 确保final_color存在
-                if 'final_color' not in p:
-                    if p['index'] in self.ornament_map:
-                        p['final_color'] = random.choice(['#e91e63', '#f44336', '#ffeb3b', '#03a9f4', '#9c27b0'])
-                    else:
-                        p['final_color'] = '#2e7d32'
-            if self.animation_running:
-                self.root.after(60, self.animate)
+            self.elapsed_before_pause = self.current_elapsed()
+            self.paused = True
+            self.pause_var.set("Resume")
+            if self.after_id:
+                self.root.after_cancel(self.after_id)
+                self.after_id = None
 
-    def show_greeting(self):
-        # show a messagebox greeting including the name
-        title = 'Happy Holidays!'
-        who = self.name if self.name else 'Friend'
-        msg = f'Merry Christmas, {who}!\nMay your holidays be joyful.'
-        # Use a non-blocking transient Toplevel instead of a blocking messagebox
-        try:
-            top = tk.Toplevel(self.root)
-            top.title(title)
-            # position near center
-            top.geometry(f"+{self.root.winfo_x() + self.width//2 - 150}+{self.root.winfo_y() + 80}")
-            lbl = tk.Label(top, text=msg, font=('Helvetica', 14, 'bold'), bg='#0b1220', fg='white')
-            lbl.pack(padx=12, pady=12)
-            top.transient(self.root)
-            # auto-close after a short duration
-            top.after(3600, top.destroy)
-        except Exception:
-            # fallback: draw text on canvas (non-blocking)
-            self.canvas.create_text(self.width//2, 30, text=msg, fill='white', font=('Helvetica', 16, 'bold'))
+    def replay(self) -> None:
+        self.scene.reseed()
+        self.start_time = time.perf_counter()
+        self.elapsed_before_pause = 0.0
+        self.paused = False
+        self.pause_var.set("Pause")
+        self.status_var.set(f"{len(self.scene.tree_particles):,} particles")
+        self._schedule()
 
-    def render_text_pixels(self, text, top_y):
-        # Render `text` to a small monochrome image then create pixel rectangles
-        # Returns list of canvas ids for the pixels
-        # Render text to a monochrome image and return pixel centers for PIL drawing
-        font = ImageFont.load_default()
-        tmp_img = Image.new('L', (1, 1), 0)
-        tmp_draw = ImageDraw.Draw(tmp_img)
-        try:
-            bbox = tmp_draw.textbbox((0, 0), text, font=font)
-            w = bbox[2] - bbox[0]
-            h = bbox[3] - bbox[1]
-        except Exception:
-            try:
-                w, h = tmp_draw.textsize(text, font=font)
-            except Exception:
-                return []
+    def save_snapshot(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save PNG",
+            defaultextension=".png",
+            initialfile=f"aurora_tree_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            filetypes=[("PNG image", "*.png")],
+        )
+        if not path:
+            return
+        self.scene.render(self.current_elapsed()).save(path)
+        self.status_var.set(f"Saved {Path(path).name}")
 
-        if w == 0 or h == 0:
-            return []
+    def next_theme(self) -> None:
+        themes = list(THEMES)
+        next_index = (themes.index(self.scene.theme_name) + 1) % len(themes)
+        self.scene.set_theme(themes[next_index])
+        self.theme_var.set(f"Theme: {self.scene.theme['name']}")
 
-        img = Image.new('L', (w, h), 0)
-        draw = ImageDraw.Draw(img)
-        draw.text((0, 0), text, fill=255, font=font)
+    def _schedule(self) -> None:
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+        self.after_id = self.root.after(24, self.animate)
 
-        coords = []
-        start_x = (self.width - (w * (self.pixel_size + 1))) // 2
-        for py in range(h):
-            for px in range(w):
-                val = img.getpixel((px, py))
-                if val > 64:
-                    x = start_x + px * (self.pixel_size + 1)
-                    y = top_y + py * (self.pixel_size + 1)
-                    coords.append((x, y))
-        return coords
+    def animate(self) -> None:
+        self.after_id = None
+        image = self.scene.render(self.current_elapsed())
+        self.photo = ImageTk.PhotoImage(image)
+        self.canvas.itemconfigure(self.canvas_image, image=self.photo)
+        if not self.paused:
+            self._schedule()
 
-    def on_close(self):
-        self.animation_running = False
-        self.root.destroy()
-
-    def run(self):
-        # start animation
-        self.root.after(200, self.animate)
+    def run(self) -> None:
+        self._schedule()
         self.root.mainloop()
 
+    def close(self) -> None:
+        if self.after_id:
+            self.root.after_cancel(self.after_id)
+        if self.resize_after_id:
+            self.root.after_cancel(self.resize_after_id)
+        self.root.destroy()
 
-def ask_name_and_run():
-    # small temporary root used for dialog, then destroyed
-    dialog_root = tk.Tk()
-    dialog_root.withdraw()
-    name = simpledialog.askstring('Your Name', 'Please type your name for the greeting:', parent=dialog_root)
-    dialog_root.destroy()
 
-    app = ChristmasTreeGUI(name=name)
+def ask_name() -> str:
+    load_tkinter()
+    dialog = tk.Tk()
+    dialog.withdraw()
+    value = simpledialog.askstring("Aurora Christmas Tree", "Name for the greeting:", parent=dialog)
+    dialog.destroy()
+    return value or "Friend"
+
+
+def save_preview(path: str, name: str, width: int, height: int, theme: str, density: float) -> Path:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    scene = ParticleTreeScene(width, height, name, theme=theme, density=density, seed=20241225)
+    scene.render(5.0).save(output)
+    return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Render an animated GUI Christmas tree made from tiny particles.")
+    parser.add_argument("--name", default=None, help="Name displayed in the greeting")
+    parser.add_argument("--width", type=int, default=1100, help="Window or preview width")
+    parser.add_argument("--height", type=int, default=780, help="Window or preview height")
+    parser.add_argument("--theme", choices=sorted(THEMES), default="aurora", help="Initial color theme")
+    parser.add_argument("--density", type=float, default=1.0, help="Particle density from 0.55 to 1.65")
+    parser.add_argument("--preview", help="Save a static PNG preview and exit")
+    parser.add_argument("--no-dialog", action="store_true", help="Use --name or Friend without opening the name dialog")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    name = args.name or "Friend"
+    density = clamp(args.density, 0.55, 1.65)
+    if args.preview:
+        output = save_preview(args.preview, name, args.width, args.height, args.theme, density)
+        print(f"Preview saved to {output}")
+        return
+
+    if args.name is None and not args.no_dialog:
+        name = ask_name()
+    app = ChristmasTreeApp(name=name, width=args.width, height=args.height, theme=args.theme, density=density)
     app.run()
 
 
-if __name__ == '__main__':
-    ask_name_and_run()
+if __name__ == "__main__":
+    main()
