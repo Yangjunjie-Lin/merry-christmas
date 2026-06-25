@@ -103,19 +103,21 @@ python tree_gui.py --theme ruby --density 1.3
 
 ## Project Structure
 
+
 ```text
 .
-|-- assets/
-|   `-- preview.png
-|-- .github/
-|   `-- workflows/
-|       `-- ci.yml
-|-- tree_gui.py
-|-- requirements.txt
-|-- pyproject.toml
-|-- LICENSE
-`-- README.md
+├── assets/
+│   └── preview.png
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── tree_gui.py
+├── requirements.txt
+├── pyproject.toml
+├── LICENSE
+└── README.md
 ```
+
 
 ## Quality Checks
 
