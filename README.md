@@ -4,6 +4,7 @@ A polished desktop Christmas tree rendered from thousands of tiny animated parti
 
 ![Aurora Christmas Tree preview](assets/preview.png)
 
+
 ## Highlights
 
 - Dense particle tree with thousands of independently animated points.
