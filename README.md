@@ -29,7 +29,7 @@ A polished desktop Christmas tree rendered from thousands of tiny animated parti
 Clone the repository and install the runtime dependency:
 
 ```bash
-git clone https://github.com/<your-username>/merry-christmas.git
+git clone https://github.com/yangjunjie-lin/merry-christmas.git
 cd merry-christmas
 python -m venv .venv
 ```
